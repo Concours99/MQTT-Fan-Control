@@ -16,7 +16,7 @@
 //#########################################################################
 // 2025-January-18 changes
 // 1. Send RF 4 times with a 15 second delay to ensure it is received
-// 2. Add code to handle new mqtt topics for light brightness (at the moment only 0, 50, 100)
+// 2. Add code to handle new mqtt topics for light brightness (at the momoent only 0, 50, 100)
 // 3. Added a name for this device and changed the SSID to the IoT network
 // 2025-January-27 changes
 // 1. complete rewrite with a simpler interface (just two mqtt topics, 1 for light and 1 for speed)
@@ -144,15 +144,18 @@ int calculateChecksum(int number) {
   return sum % 16;
 }
 
-int lightBrightnessConvertPctToXmit(int value) {
-  if (value == 0) {
+int fanSpeedConvertPctToXmit(int pct) {
+  // Converts a percentage on to the proper code to be transmitted
+  if (pct == 0) {
     return 0;
-  } else if (value == 100) {
+  }
+  else if (pct == 100) {
     return 1;
-  } else {
+  }
+  else {
     // Blazer the Laser used the map() function to do the following conversion.
     // I didn't like the way it mapped.  For example, 1 and 2 should be 50.  map() also made 3 and 4 map to 50.
-    return 50 - round((((float) value - 1.0) * 48.0) / 98.0); // Maps 1->50, 99->2
+    return round(50.0 - (50.0 * ((float) pct / 100.0))); // Encode for transmit (map 1-100 range into 50-1 range)
   }
 }
 
@@ -166,7 +169,7 @@ void transmitState(int fanId) {
   // Determine light and fan component of RF code
   int fanRf = myfan.speed;
   // Determine light component of RF code
-  int lightRf = lightBrightnessConvertPctToXmit(myfan.light);
+  int lightRf = fanSpeedConvertPctToXmit(myfan.light);
   // Build out RF code
   //   Code follows the 21 bit pattern
   //   000xxxxyyyyyyyzzccccc
