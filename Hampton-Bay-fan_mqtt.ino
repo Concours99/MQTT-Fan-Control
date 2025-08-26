@@ -16,8 +16,12 @@
 //#########################################################################
 // 2025-January-18 changes
 // 1. Send RF 4 times with a 15 second delay to ensure it is received
-// 2. Add code to handle new mqtt topics for light brightness (at the momoent only 0, 50, 100)
+// 2. Add code to handle new mqtt topics for light brightness (at the moment only 0, 50, 100)
 // 3. Added a name for this device and changed the SSID to the IoT network
+// 2025-January-27 changes
+// 1. complete rewrite with a simpler interface (just two mqtt topics, 1 for light and 1 for speed)
+// 2025-August-10 changes
+// 1. Thanks to "Blazer the Laser" for decoding the light brightness levels
 //
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 #include <RCSwitch.h>
@@ -26,16 +30,11 @@
 #include "SecretStuff.h" // WiFi and MQTT definitions I don't want to expose
 
 // Configure MQTT broker settings
-#define MQTT_CLIENT_NAME "HAMPTONBAY"
-#define BASE_TOPIC "homeassistant/hamptonbay"
+#define MQTT_CLIENT_NAME "FamilyRoomFanController"
+#define BASE_TOPIC "homeassistant/familyroomfan"
 
-#define STATUS_TOPIC "homeassistant/hamptonbay/status"
-#define SUBSCRIBE_TOPIC_ON_SET BASE_TOPIC "/+/on/set"
-#define SUBSCRIBE_TOPIC_ON_STATE BASE_TOPIC "/+/on/state"
-#define SUBSCRIBE_TOPIC_SPEED_SET BASE_TOPIC "/+/speed/set"
-#define SUBSCRIBE_TOPIC_SPEED_STATE BASE_TOPIC "/+/speed/state"
-#define SUBSCRIBE_TOPIC_LIGHT_SET BASE_TOPIC "/+/light/set"
-#define SUBSCRIBE_TOPIC_LIGHT_STATE BASE_TOPIC "/+/light/state"
+#define SUBSCRIBE_TOPIC_SPEED "homeassistant/familyroomfan/speed" // off, low, medium, hight
+#define SUBSCRIBE_TOPIC_LIGHT "homeassistant/familyroomfan/light" // %
 
 // Set receive and transmit pin numbers (GDO0 and GDO2)
 #ifdef ESP32 // for esp32! Receiver on GPIO pin 4. Transmit on GPIO pin 2.
@@ -54,18 +53,19 @@
 // 303.85 determined from FCC id: CHQ8BT7096T on rear of remote
 // 303.875 from https://www.richardn.ca/posts/CeilingFanRemoteHacking/ project
 // 303.904 from https://www.laser.com/dhouston/frequency.html using FCC id: CHQ8BT7096T
-#define FREQUENCY     303.85                                                                                 
+#define FREQUENCY 303.85                                                                                 
 
 // RC-switch settings
 #define RF_PROTOCOL 6
 #define RF_REPEATS  8
 
 // Define fan states
+#define FAN_OFF 0
 #define FAN_HI  1
 #define FAN_MED 2
 #define FAN_LOW 3
 
-#define RFnumTransmits 4 // Number of times to transmit RF code
+#define RFnumTransmits 3 // Number of times to transmit RF code
 #define RFTransmitDelay 5000 // 5 seconds
 
 const char *fanStateTable[4] = {
@@ -76,7 +76,6 @@ RCSwitch mySwitch = RCSwitch();
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-
 int long value;      // int to save value
 int bits;           // int to save bit number
 int prot;          // int to save Protocol number
@@ -84,11 +83,10 @@ int prot;          // int to save Protocol number
 // Keep track of states for all dip settings
 struct fan
 {
-  bool lightState;
-  bool fanState;
-  uint8_t fanSpeed;
+  uint8_t light;
+  uint8_t speed;
 };
-fan fans[16];
+fan myfan;
 
 
 // The ID returned from the RF code appears to be inversed and reversed
@@ -146,6 +144,18 @@ int calculateChecksum(int number) {
   return sum % 16;
 }
 
+int lightBrightnessConvertPctToXmit(int value) {
+  if (value == 0) {
+    return 0;
+  } else if (value == 100) {
+    return 1;
+  } else {
+    // Blazer the Laser used the map() function to do the following conversion.
+    // I didn't like the way it mapped.  For example, 1 and 2 should be 50.  map() also made 3 and 4 map to 50.
+    return 50 - round((((float) value - 1.0) * 48.0) / 98.0); // Maps 1->50, 99->2
+  }
+}
+
 void transmitState(int fanId) {
   ELECHOUSE_cc1101.SetTx();           // set Transmit on
   mySwitch.disableReceive();         // Receiver off
@@ -153,112 +163,79 @@ void transmitState(int fanId) {
   mySwitch.setRepeatTransmit(RF_REPEATS); // transmission repetitions.
   mySwitch.setProtocol(RF_PROTOCOL);        // send Received Protocol
 
-  // Determine fan component of RF code
-  int fanRf = fans[fanId].fanState ? fans[fanId].fanSpeed : 0;
+  // Determine light and fan component of RF code
+  int fanRf = myfan.speed;
   // Determine light component of RF code
-  int lightRf = fans[fanId].lightState ? 26 : 0; // 50% brightness if light is on
+  int lightRf = lightBrightnessConvertPctToXmit(myfan.light);
   // Build out RF code
   //   Code follows the 21 bit pattern
-  //   000xxxx000000yzzccccc
-  //   Where x is the inversed/reversed dip setting, 
-  //     y is light state, z is fan speed
-  //	 c is the checksum
+  //   000xxxxyyyyyyyzzccccc
+  //   Where
+  //     x is the inversed/reversed dip setting, 
+  //     y is light state (0 is off, otherwise it is a value from 1 (100%) to 50 (1%))
+  //     z is fan speed
+  //	   c is the checksum
   int rfCode = dipToRfIds[fanId] << 9 | lightRf << 2 | fanRf;
   rfCode = rfCode << 5 | calculateChecksum(rfCode);
   
+  Serial.print("Dip switches = ");
+  Serial.print(dipToRfIds[fanId]);
+  Serial.print(" speed = ");
+  Serial.print(fanRf);
+  Serial.print(" light = ");
+  Serial.println(lightRf);
+
   mySwitch.send(rfCode, 21);      // send 21 bit code
   Serial.print("Sending rfCode: ");
   Serial.println(rfCode);
-  ELECHOUSE_cc1101.SetRx();      // set Receive on
   mySwitch.disableTransmit();   // set Transmit off
-  mySwitch.enableReceive(RX_PIN);   // Receiver on
-
-  postStateUpdate(fanId);
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
+  char payloadchar[length + 1];
   Serial.print("Message arrived [");
   Serial.print(topic);
   Serial.print("] ");
   for (int i = 0; i < length; i++) {
     Serial.print((char)payload[i]);
+    payloadchar[i] = payload[i];
   }
-  Serial.println();
+  payloadchar[length] = '\0';
+  Serial.print(" (");
+  Serial.print(payloadchar);
+  Serial.println(")");
 
-  char payloadChar[length + 1];
-  sprintf(payloadChar, "%s", payload);
-  payloadChar[length] = '\0';
-
-  // Get ID after the base topic + a slash
-  char id[5];
-  memcpy(id, &topic[sizeof(BASE_TOPIC)], 4);
-  id[4] = '\0';
-  if(strspn(id, idchars)) {
-    uint8_t idint = strtol(id, (char**) NULL, 2);
-    char *attr;
-    char *action;
-    // Split by slash after ID in topic to get attribute and action
-    attr = strtok(topic+sizeof(BASE_TOPIC) + 5, "/");
-    action = strtok(NULL, "/");
-    // Convert payload to lowercase
-    for(int i=0; payloadChar[i]; i++) {
-      payloadChar[i] = tolower(payloadChar[i]);
+  if(strcmp(topic, SUBSCRIBE_TOPIC_SPEED) == 0) {
+    Serial.print("Fan speed being set to ");
+    if(((String) payloadchar).startsWith("low")) {
+      myfan.speed = FAN_LOW;
+      Serial.print("low (");
     }
-    
-    if(strcmp(attr, "on") == 0) {
-      if(strcmp(payloadChar, "on") == 0) {
-        fans[idint].fanState = true;
-      }
-      else if(strcmp(payloadChar, "off") == 0) {
-        fans[idint].fanState = false;
-      }
+    else if(((String) payloadchar).startsWith("medium")) {
+      myfan.speed = FAN_MED;
+      Serial.print("medium (");
     }
-    else if(strcmp(attr, "speed") == 0) {
-      if(strcmp(payloadChar, "low") == 0) {
-        fans[idint].fanSpeed = FAN_LOW;
-      }
-      else if(strcmp(payloadChar, "medium") == 0) {
-        fans[idint].fanSpeed = FAN_MED;
-      }
-      else if(strcmp(payloadChar, "high") == 0) {
-        fans[idint].fanSpeed = FAN_HI;
-      }
+    else if(((String) payloadchar).startsWith("high")) {
+      myfan.speed = FAN_HI;
+      Serial.print("high (");
     }
-    else if(strcmp(attr, "light") == 0) {
-      if(strcmp(payloadChar, "on") == 0) {
-        fans[idint].lightState = true;
-      }
-      else if(strcmp(payloadChar, "off") == 0) {
-        fans[idint].lightState = false;
-      }
+    else if(((String) payloadchar).startsWith("off")) {
+      myfan.speed = FAN_OFF;
+      Serial.print("off (");
     }
-    if(strcmp(action, "set") == 0) {
-      // Send the command several times to ensure it is received
-      for (int i = 0; i < RFnumTransmits; i++) {
-        transmitState(idint);
-        delay(RFTransmitDelay);
-      }
-    }
+    Serial.print(myfan.speed);
+    Serial.println(")");
   }
+  else if(strcmp(topic, SUBSCRIBE_TOPIC_LIGHT) == 0) {
+    myfan.light = ((String) payloadchar).toInt();
+    Serial.print("Fan light being set to ");
+    Serial.println(myfan.light);
+}
   else {
-    // Invalid ID
+    // Unknown topic
     return;
   }
-}
-
-void postStateUpdate(int id) {
-  char outTopic[100];
-  Serial.println("Publishing fan data");
-  return; // don't publish anything
-
-  sprintf(outTopic, "%s/%s/on/state", BASE_TOPIC, idStrings[id]);
-  client.publish(outTopic, fans[id].fanState ? "on":"off", true);
-
-  sprintf(outTopic, "%s/%s/speed/state", BASE_TOPIC, idStrings[id]);
-  client.publish(outTopic, fanStateTable[fans[id].fanSpeed], true);
-
-  sprintf(outTopic, "%s/%s/light/state", BASE_TOPIC, idStrings[id]);
-  client.publish(outTopic, fans[id].lightState ? "on":"off", true);
+  transmitState(10); // hardwired my fan ID
 }
 
 void reconnect() {
@@ -266,18 +243,10 @@ void reconnect() {
   while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
     // Attempt to connect
-    if (client.connect(MQTT_CLIENT_NAME, SECRET_MQTT_USER, SECRET_MQTT_PASS, STATUS_TOPIC, 0,
-	                   true, "offline")) {
+    if (client.connect(MQTT_CLIENT_NAME, SECRET_MQTT_USER, SECRET_MQTT_PASS)) {
       Serial.println("connected");
-      // Once connected, publish an announcement...
-      client.publish(STATUS_TOPIC, "online", true);
-      // ... and resubscribe
-      client.subscribe(SUBSCRIBE_TOPIC_ON_SET);
-      client.subscribe(SUBSCRIBE_TOPIC_ON_STATE);
-      client.subscribe(SUBSCRIBE_TOPIC_SPEED_SET);
-      client.subscribe(SUBSCRIBE_TOPIC_SPEED_STATE);
-      client.subscribe(SUBSCRIBE_TOPIC_LIGHT_SET);
-      client.subscribe(SUBSCRIBE_TOPIC_LIGHT_STATE);
+      client.subscribe(SUBSCRIBE_TOPIC_SPEED);
+      client.subscribe(SUBSCRIBE_TOPIC_LIGHT);
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -292,11 +261,8 @@ void setup() {
   Serial.begin(9600);
 
   // initialize fan struct
-  for(int i=0; i<16; i++) {
-    fans[i].lightState = false;
-    fans[i].fanState = false;
-    fans[i].fanSpeed = FAN_LOW;
-  }
+  myfan.light = 0;
+  myfan.speed = FAN_OFF;
 
   ELECHOUSE_cc1101.Init();
   ELECHOUSE_cc1101.setMHZ(FREQUENCY);
@@ -314,44 +280,4 @@ void loop() {
     reconnect();
   }
   client.loop();
-
-  // Handle received transmissions
-  if (mySwitch.available()) {
-    Serial.println("Getting received value");
-    value =  mySwitch.getReceivedValue();        // save received Value
-    prot = mySwitch.getReceivedProtocol();     // save received Protocol
-    bits = mySwitch.getReceivedBitlength();     // save received Bitlength
-
-    Serial.print(prot);
-    Serial.print(" - ");
-    Serial.print(value);
-    Serial.print(" - ");
-    Serial.println(bits);
-
-    if( prot == 6 && bits == 21 ) {
-      int id = value >> 14;
-      // Got a correct id in the correct protocol
-      if(id < 16) {
-        // Convert to dip id
-        int dipId = dipToRfIds[id];
-        Serial.print("Received command from ID - ");
-        Serial.println(dipId);
-        // Blank out id in message to get light state
-        int states = value & 0b11111111;
-        bool light = states >> 7;
-        // Blank out light state to get fan state
-        int fan = (states & 0b01111111) >> 5;
-        if(fan == 0) {
-          fans[dipId].fanState = false;
-        }
-        else {
-          fans[dipId].fanState = true;
-          fans[dipId].fanSpeed = fan;
-        }
-        fans[dipId].lightState = light;
-        postStateUpdate(dipId);
-      }
-    }
-    mySwitch.resetAvailable();
-  }
 }
