@@ -57,7 +57,7 @@
 
 // RC-switch settings
 #define RF_PROTOCOL 6
-#define RF_REPEATS  8
+#define RF_REPEATS  15
 
 // Define fan states
 #define FAN_OFF 0
